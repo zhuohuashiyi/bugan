@@ -1,12 +1,15 @@
-from mxnet import gluon, image, nd, init, autograd
+from mxnet import gluon, image, nd, init, autograd, cpu, Context
 from mxnet.gluon import data as gdata, utils as gutils, loss as gloss, model_zoo, nn
 import os
 import sys
 import tarfile
 import numpy as np
+import time
+from matplotlib import pyplot as plt
 
 
-voc_dir = '../data/VOCdevkit/VOC2012'
+ctx = [cpu()]
+voc_dir = '../data/VOC2012'
 VOC_COLORMAP = [[0, 0, 0], [128, 0, 0], [0, 128, 0], [128, 128, 0],
                 [0, 0, 128], [128, 0, 128], [0, 128, 128], [128, 128, 128],
                 [64, 0, 0], [192, 0, 0], [64, 128, 0], [192, 128, 0],
@@ -20,7 +23,6 @@ VOC_CLASSES = ['background', 'aeroplane', 'bicycle', 'bird', 'boat',
 colormap2label = nd.zeros(256 ** 3)
 for i, colormap in enumerate(VOC_COLORMAP):
     colormap2label[(colormap[0] * 256 + colormap[1]) * 256 + colormap[2]] = i
-
 
 class VOCSegDataset(gdata.Dataset):
     def __init__(self, is_train, crop_size, voc_dir, colormap2label):
@@ -51,6 +53,32 @@ class VOCSegDataset(gdata.Dataset):
     def __len__(self):
         return len(self.features)
 
+def read_voc_images(root=voc_dir, is_train=True):
+    txt_fname = '%s/ImageSets/Segmentation/%s' % (
+        root, 'train.txt' if is_train else 'val.txt')
+    with open(txt_fname, 'r') as f:
+        images = f.read().split()
+    features, labels = [None] * len(images), [None] * len(images)
+    for i, fname in enumerate(images):
+        features[i] = image.imread('%s/JPEGImages/%s.jpg' % (root, fname))
+        labels[i] = image.imread(
+            '%s/SegmentationClass/%s.png' % (root, fname))
+    return features, labels
+
+train_features, train_labels = read_voc_images()
+crop_size = (320, 480)
+voc_train = VOCSegDataset(True, crop_size, voc_dir, colormap2label)
+voc_test = VOCSegDataset(False, crop_size, voc_dir, colormap2label)
+batch_size = 32
+num_workers = 0 if sys.platform.startswith('win32') else 4
+train_iter = gdata.DataLoader(voc_train, batch_size, shuffle=True,
+                                  last_batch='discard', num_workers=num_workers)
+test_iter = gdata.DataLoader(voc_test, batch_size, last_batch='discard',
+                                 num_workers=num_workers)
+
+
+
+
 def download_voc_pascal(data_dir='../data'):
     voc_dir = os.path.join(data_dir, 'VOCdevkit/VOC2012')
     url = ('http://host.robots.ox.ac.uk/pascal/VOC/voc2012'
@@ -62,18 +90,7 @@ def download_voc_pascal(data_dir='../data'):
     return voc_dir
 
 
-def read_voc_images(root=voc_dir, is_train=True):
-    txt_fname = '%s/ImageSets/Segmentation/%s' % (
-        root, 'train.txt' if is_train else 'val.txt')
-    with open(txt_fname, 'r') as f:
-        images = f.read().split()
-    features, labels = [None] * len(images), [None] * len(images)
-    for i, fname in enumerate(images):
-        print(fname)
-        features[i] = image.imread('%s/JPEGImages/%s.jpg' % (root, fname))
-        labels[i] = image.imread(
-            '%s/SegmentationClass/%s.png' % (root, fname))
-    return features, labels
+
  
 
 
@@ -113,51 +130,73 @@ def predict(img):
 
 
 def label2image(pred):
-    colormap = nd.array(d2l.VOC_COLORMAP, ctx=ctx[0], dtype='uint8')
+    colormap = nd.array(VOC_COLORMAP, ctx=ctx[0], dtype='uint8')
     X = pred.astype('int32')
     return colormap[X, :]
 
 
-def evaluate_accuracy(data_iter, net):
-    acc_sum, n = 0.0, 0
-    for X, y in data_iter:
-        y = y.astype('float32')
-        acc_sum += (net(X).argmax(axis=1) == y).sum().asscalar()
-        n += y.size
-    return acc_sum / n
+def _get_batch(batch, ctx):
+    features, labels = batch
+    if labels.dtype != features.dtype:
+        labels = labels.astype(features.dtype)
+    return (gutils.split_and_load(features, ctx),
+            gutils.split_and_load(labels, ctx), features.shape[0])
 
-
-def train(net, train_iter, test_iter, loss, num_epochs, batch_size,
-              params=None, lr=None, trainer=None):
-    for epoch in range(num_epochs):
-        train_l_sum, train_acc_sum, n = 0.0, 0.0, 0
-        for X, y in train_iter:
-            with autograd.record():
-                y_hat = net(X)
-                l = loss(y_hat, y).sum()
-            l.backward()
-            trainer.step(batch_size)
+def evaluate_accuracy(data_iter, net, ctx=[cpu()]):
+    if isinstance(ctx, Context):
+        ctx = [ctx]
+    acc_sum, n = nd.array([0]), 0
+    for batch in data_iter:
+        features, labels, _ = _get_batch(batch, ctx)
+        for X, y in zip(features, labels):
             y = y.astype('float32')
-            train_l_sum += l.asscalar()
-            train_acc_sum += (y_hat.argmax(axis=1) == y).sum().asscalar()
+            acc_sum += (net(X).argmax(axis=1) == y).sum().copyto(cpu())
             n += y.size
-        test_acc = evaluate_accuracy(test_iter, net)
-        print('epoch %d, loss %.4f, train acc %.3f, test acc %.3f'
-              % (epoch + 1, train_l_sum / n, train_acc_sum / n, test_acc))
+        acc_sum.wait_to_read()
+    return acc_sum.asscalar() / n
 
+def train(train_iter, test_iter, net, loss, trainer, ctx, num_epochs):
+    print('training on', ctx)
+    if isinstance(ctx, Context):
+        ctx = [ctx]
+    for epoch in range(num_epochs):
+        train_l_sum, train_acc_sum, n, m, start = 0.0, 0.0, 0, 0, time.time()
+        for i, batch in enumerate(train_iter):
+            Xs, ys, batch_size = _get_batch(batch, ctx)
+            ls = []
+            with autograd.record():
+                y_hats = [net(X) for X in Xs]
+                ls = [loss(y_hat, y) for y_hat, y in zip(y_hats, ys)]
+            for l in ls:
+                l.backward()
+            trainer.step(batch_size)
+            train_l_sum += sum([l.sum().asscalar() for l in ls])
+            n += sum([l.size for l in ls])
+            train_acc_sum += sum([(y_hat.argmax(axis=1) == y).sum().asscalar()
+                                 for y_hat, y in zip(y_hats, ys)])
+            m += sum([y.size for y in ys])
+        test_acc = evaluate_accuracy(test_iter, net, ctx)
+        print('epoch %d, loss %.4f, train acc %.3f, test acc %.3f, '
+              'time %.1f sec'
+              % (epoch + 1, train_l_sum / n, train_acc_sum / m, test_acc,
+                 time.time() - start))
+
+# 本函数已保存在d2lzh包中方便以后使用
+def show_images(imgs, num_rows, num_cols, scale=2):
+    figsize = (num_cols * scale, num_rows * scale)
+    _, axes = plt.subplots(num_rows, num_cols, figsize=figsize)
+    for i in range(num_rows):
+        for j in range(num_cols):
+            axes[i][j].imshow(imgs[i * num_cols + j].asnumpy())
+            axes[i][j].axes.get_xaxis().set_visible(False)
+            axes[i][j].axes.get_yaxis().set_visible(False)
+    return axes
 
 if __name__ == "__main__":
-    download_voc_pascal()
-    train_features, train_labels = read_voc_images()
-    crop_size = (320, 480)
-    voc_train = VOCSegDataset(True, crop_size, voc_dir, colormap2label)
-    voc_test = VOCSegDataset(False, crop_size, voc_dir, colormap2label)
-    batch_size = 32
-    num_workers = 0 if sys.platform.startswith('win32') else 4
-    train_iter = gdata.DataLoader(voc_train, batch_size, shuffle=True,
-                                  last_batch='discard', num_workers=num_workers)
-    test_iter = gdata.DataLoader(voc_test, batch_size, last_batch='discard',
-                                 num_workers=num_workers)
+    
+   
+                                
+    
     pretrained_net = model_zoo.vision.resnet18_v2(pretrained=True)
     net = nn.HybridSequential()
     for layer in pretrained_net.features[:-2]:
@@ -166,14 +205,25 @@ if __name__ == "__main__":
     net.add(nn.Conv2D(num_classes, kernel_size=1),
             nn.Conv2DTranspose(num_classes, kernel_size=64, padding=16,
                                strides=32))
+    '''
     net[-1].initialize(init.Constant(bilinear_kernel(num_classes, num_classes,
                                                      64)))
     net[-2].initialize(init=init.Xavier())
+
     loss = gloss.SoftmaxCrossEntropyLoss(axis=1)
-    net.collect_params()
+    net.collect_params().reset_ctx(ctx)
     trainer = gluon.Trainer(net.collect_params(), 'sgd', {'learning_rate': 0.1,
                                                           'wd': 1e-3})
-    train(net, train_iter, test_iter, loss, 5, batch_size, lr=0.01, trainer=trainer)
+    train(train_iter, test_iter, net, loss, trainer, ctx, num_epochs=5)'''
     filename = 'FCN.params'
-    net.save_parameters(filename)
+    net.collect_params().load(filename, ctx)
+    name = 'demo.jpg'
+    imgs = []
+    crop_rect = (0, 0, 480, 320)
+    img = image.imread(name)
+    X = image.fixed_crop(img, *crop_rect)
+    pred = label2image(predict(X))
+    imgs += [X, pred]
+    show_images(imgs, 1, 2)
+    plt.show()
     
