@@ -5,6 +5,7 @@ import sys
 import tarfile
 import numpy as np
 import time
+import cv2
 from matplotlib import pyplot as plt
 
 
@@ -142,6 +143,7 @@ def _get_batch(batch, ctx):
     return (gutils.split_and_load(features, ctx),
             gutils.split_and_load(labels, ctx), features.shape[0])
 
+
 def evaluate_accuracy(data_iter, net, ctx=[cpu()]):
     if isinstance(ctx, Context):
         ctx = [ctx]
@@ -154,6 +156,7 @@ def evaluate_accuracy(data_iter, net, ctx=[cpu()]):
             n += y.size
         acc_sum.wait_to_read()
     return acc_sum.asscalar() / n
+
 
 def train(train_iter, test_iter, net, loss, trainer, ctx, num_epochs):
     print('training on', ctx)
@@ -181,6 +184,7 @@ def train(train_iter, test_iter, net, loss, trainer, ctx, num_epochs):
               % (epoch + 1, train_l_sum / n, train_acc_sum / m, test_acc,
                  time.time() - start))
 
+
 # 本函数已保存在d2lzh包中方便以后使用
 def show_images(imgs, num_rows, num_cols, scale=2):
     figsize = (num_cols * scale, num_rows * scale)
@@ -192,11 +196,8 @@ def show_images(imgs, num_rows, num_cols, scale=2):
             axes[i][j].axes.get_yaxis().set_visible(False)
     return axes
 
+
 if __name__ == "__main__":
-    
-   
-                                
-    
     pretrained_net = model_zoo.vision.resnet18_v2(pretrained=True)
     net = nn.HybridSequential()
     for layer in pretrained_net.features[:-2]:
@@ -205,25 +206,33 @@ if __name__ == "__main__":
     net.add(nn.Conv2D(num_classes, kernel_size=1),
             nn.Conv2DTranspose(num_classes, kernel_size=64, padding=16,
                                strides=32))
-    '''
+    
     net[-1].initialize(init.Constant(bilinear_kernel(num_classes, num_classes,
                                                      64)))
     net[-2].initialize(init=init.Xavier())
+    #loss = gloss.SoftmaxCrossEntropyLoss(axis=1)
+   # net.collect_params().reset_ctx(ctx)
+    #trainer = gluon.Trainer(net.collect_params(), 'sgd', {'learning_rate': 0.1,
+                                                        #  'wd': 1e-3})
+    #train(train_iter, test_iter, net, loss, trainer, ctx, num_epochs=5)
 
-    loss = gloss.SoftmaxCrossEntropyLoss(axis=1)
-    net.collect_params().reset_ctx(ctx)
-    trainer = gluon.Trainer(net.collect_params(), 'sgd', {'learning_rate': 0.1,
-                                                          'wd': 1e-3})
-    train(train_iter, test_iter, net, loss, trainer, ctx, num_epochs=5)'''
     filename = 'FCN.params'
     net.collect_params().load(filename, ctx)
     name = 'demo.jpg'
-    imgs = []
-    crop_rect = (0, 0, 480, 320)
     img = image.imread(name)
-    X = image.fixed_crop(img, *crop_rect)
+    X = cv2.resize(img.asnumpy(), (480, 320))
+    print(type(X))
+    X = nd.array(X)
+    print(type(X))
     pred = label2image(predict(X))
-    imgs += [X, pred]
-    show_images(imgs, 1, 2)
+    print(X.shape)
+    print(pred.shape)
+    plt.imshow(X.asnumpy())
+    plt.imshow(pred.asnumpy())
+    #cv2.imwrite('crop.jpg', X.asnumpy())
+    #cv2.imwrite('res.jpg', pred.asnumpy())
+    #image.imsave(pred, 'crop.jpg')
+    #imgs += [X, pred]
+    #show_images(imgs, 1, 2)
     plt.show()
     
